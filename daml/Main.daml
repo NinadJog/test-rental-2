@@ -1,0 +1,272 @@
+module Main where
+
+import DA.Date
+
+{- Revised version of the apartment rental program
+
+   * Has a cleaner workflow
+   * Uses the Propose and Accept pattern
+   * Separates the Rental payment logistics contract from the rental agreement
+   * Composes choices
+   * Does not use stable keys
+
+    Author: Ninad Jog
+    May 8, 2021
+
+    TBD:
+    * Calculate rent penalties accurately
+    * Calculate unpaid rent of previous months
+    * Update penalties in ledger
+    * Archive contracts gracefully when the lease ends
+    * Rental payments logistics should be in a separate module
+-}
+-- =======================================================================
+data Currency = USD | Euro
+    deriving (Show, Eq)
+
+createRentalTerms : RentalTerms
+createRentalTerms = RentalTerms 
+  with
+    currency  = USD
+    rent      = 800   -- Rent per month
+
+    leasePeriod = 12  -- 12 months
+    startDate   = date 2021 Jan 1
+
+    latePercent = 10  -- 10% penalty
+    penalty     = 2   -- 2 months rent
+
+-- =======================================================================
+{- Master contract for a rental
+-}
+
+template RentalMaster
+  with
+    landlord : Party -- The landlord is the issuer
+  where
+    signatory landlord
+
+    -- Landlord can invite prospective tenant with a rental proposal
+    controller landlord can
+      nonconsuming Invite : RentalProposalId
+        with 
+          tenant : Party
+        do 
+          create RentalProposal with 
+            rentalAgreement = RentalAgreement with 
+              landlord
+              tenant
+              rentalTerms = createRentalTerms
+
+-- =======================================================================
+type RentalProposalId = ContractId RentalProposal
+
+template RentalProposal
+  with
+    rentalAgreement : RentalAgreement
+  where
+    signatory rentalAgreement.landlord -- The landlord is the issuer
+
+    -- Tenant can inspect rental terms, accept proposal, or reject it
+    controller rentalAgreement.tenant can
+    
+    -- Choice 1. When tenant accepts the proposal, it returns a result contract representing
+    -- the agreement between the two parties (landlord and tenant)
+    -- The rental proposal is archived
+      RentalProposal_Accept : (RentalAgreementId, RentalPaymentsId)
+        do 
+          rentalId <- create rentalAgreement
+          paymentId <- create RentalPayments
+            with
+              rentalId    -- Foreign key to rental agreement
+              landlord    = rentalAgreement.landlord
+              tenant      = rentalAgreement.tenant
+              bankCode   = "BOFAUS3N"  -- Landlord's bank code
+              accountNum  = "123456"    -- Landlord's account number
+
+              -- There are no payments intially
+              paymentDate = date 2020 Dec 25
+              rent        = 0
+              penalty     = 0
+              totalAmt    = 0
+          return (rentalId, paymentId)
+      
+      -- Choice 2. Tenant can reject proposal, in which case it is archived
+      RentalProposal_Reject : ()
+        do pure()
+
+      -- Choice 3. Tenant can inspect the rental terms to see if he/she likes them
+      nonconsuming RentalProposal_Inspect : RentalTerms
+        do 
+          return (rentalAgreement.rentalTerms)
+        
+      -- Choice 4. TBD: Prospective tenant can make a counteroffer (say to reduce rent)
+ 
+-- =======================================================================
+type RentalAgreementId = ContractId RentalAgreement
+
+{-
+This is the rental agreement created when a prospective tenant accepts
+a landlord's rental proposal.
+
+Making the landlord a signatory and the tenant an observer ensures that
+the tenant cannot change the rental terms.
+-}
+template RentalAgreement
+  with
+    landlord    : Party
+    tenant      : Party
+    rentalTerms : RentalTerms
+  where
+    signatory landlord
+    observer  tenant
+    ensure    (landlord /= tenant)
+
+    -- Tenant can access the rental terms
+    controller tenant can
+      nonconsuming RentalAgreement_Inspect : RentalTerms
+        do
+          return rentalTerms
+
+-- =======================================================================
+-- Rent and payment terms, including penalties
+data RentalTerms = RentalTerms with
+  rent        : Int       -- Monthly rent
+  currency    : Currency  -- "USD", "Euro", etc.
+
+  leasePeriod : Int     -- Lease period in months
+  startDate   : Date    -- Lease start date
+
+  latePercent : Int     -- Example: 5% penalty for paying after 5th of month
+  penalty     : Int     -- Penalty for breaking lease: 2 months rent payment
+    deriving (Show, Eq)
+
+-- =======================================================================
+-- HELPER FUNCTIONS
+
+-- Returns true if the two dates have the same month and year; false otherwise
+isSameMonth : Date -> Date -> Bool
+isSameMonth prevDate curDate = 
+  (curM == prevM) && (prevY == curY)
+  where
+    (prevY, prevM, _) = toGregorian prevDate
+    (curY, curM, _)   = toGregorian curDate
+
+-------------------------------
+-- Returns true if current date occurs after the lease expiry period
+-- Function ASSUMES that the lease period is 1 year (365 days)
+-- TBD: Get lease period from rental terms and add it to the start date.
+hasLeaseExpired : Date -> RentalTerms -> Bool
+hasLeaseExpired curDate rentalTerms = 
+    subDate curDate endDate > 0
+  where
+    endDate = addDays rentalTerms.startDate 365
+
+-------------------------------
+-- Calculate rent + penalty based on previous & current payment dates
+-- (This function is pure even though one of the parameters passed to it, 
+-- prevDate, comes from the ledger.)
+
+calculateRent : Date -> Date -> RentalTerms -> Int
+calculateRent prevDate newDate rentalTerms 
+
+  | daysPassed <= 0                     = 0   -- New date can't occur before previous date
+  | isSameMonth prevDate newDate        = 0   -- Can't make two rent payments in same month of same year
+  | hasLeaseExpired newDate rentalTerms = 0   -- Can't make rent payment after lease has expired
+  | otherwise                           = determineRent prevDate newDate rentalTerms
+  where
+    -- Days passed since the last payment
+    -- Subtract date of the last payment from the new payment date
+    daysPassed = subDate newDate prevDate
+
+----
+-- TBD: Handle the Int to Decimal conversion and back for calculating the penalty
+determineRent : Date -> Date -> RentalTerms -> Int
+determineRent prevDate newDate rt =
+  newRent + penalty
+  where
+    (_, prevM, _)  = toGregorian prevDate
+    (_, newM, day) = toGregorian newDate
+    newRent        = rt.rent -- (fromEnum newM - fromEnum prevM) * rt.rent
+    penalty     = ifThenElse (day <= 5) 
+                    0 -- No penalty if payment is on or before 5th of month
+                    rt.rent + rt.latePercent * rt.rent / 100
+
+-- =======================================================================
+-- TEMPLATE FOR RENTAL PAYMENT LOGISTICS
+
+type RentalPaymentsId = ContractId RentalPayments
+
+{- Template for handling payment logistics. Making the landlord the signatory
+   ensures that the tenant cannot change the details of the landlord's bank
+-}
+template RentalPayments 
+  with
+    rentalId   : RentalAgreementId  -- Foreign key to Rental Agreement
+    landlord   : Party   -- Signatory
+    tenant     : Party   -- Observer
+
+    -- Where to make payment. Landlord's bank code & account number
+    bankCode    : Text
+    accountNum  : Text
+
+    -- Payment Details
+    paymentDate : Date
+    rent        : Int
+    penalty     : Int
+    totalAmt    : Int
+
+  where
+    signatory landlord
+    observer tenant
+    ensure (tenant /= landlord) && (bankCode /= "") && (accountNum /= "")
+
+    controller tenant can
+
+      ------------------------------
+      {- Tenant can't pay rent in advance; must pay between the 1st and 5th of
+         a month for that month to avoid a penalty. Tenant can pay rent due
+         for past months, but has to pay a late penalty for each month
+
+         Tenant cannot pay rent twice for the same month, so this function
+         returns 0 if the tenant tries to do that.
+      -}
+      nonconsuming RentalPayments_GetRentDue : Int
+        with
+          newPaymentDate : Date
+        do
+          -- Get the rental terms using the RentalAgreement foreign key
+          rentalTerms <- exercise rentalId RentalAgreement_Inspect
+          let 
+            rent    = rentalTerms.rent
+            newRent = calculateRent paymentDate newPaymentDate rentalTerms
+
+          return newRent
+
+      ------------------------------
+      {- Tenant should exercise this choice to pay rent
+         TBD: This choice should exericse the RentalPayments_GetRentDue choice
+         to avoid code duplication.
+      -}
+      RentalPayments_PayRent : RentalPaymentsId
+        with
+          newPaymentDate : Date
+        do
+          
+          -- Get the following to work
+          -- newRent = exercise (ContractId this) GetRentDue
+          rentalTerms <- exercise rentalId RentalAgreement_Inspect
+          let
+            newRent = calculateRent paymentDate newPaymentDate rentalTerms
+
+          assertMsg
+            "Will not create a new ledger entry as no rent is due"
+            (newRent > 0)
+
+          create this with
+            paymentDate = newPaymentDate
+            rent        = newRent
+            totalAmt    = totalAmt + newRent
+
+
+

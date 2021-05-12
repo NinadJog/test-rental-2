@@ -1,0 +1,76 @@
+module Test.Main where
+
+import Main
+import Daml.Script
+import DA.Date
+
+rentTest = script do
+  -- 1. Create the landlord and tenant parties
+  landlord  <- allocateParty "Landlord"
+  tenant    <- allocateParty "Tenant"
+
+  -- 2. Landlord creates the master contract
+  masterId <- landlord `submit` do
+    createCmd RentalMaster
+      with landlord
+
+  -- 3. Landlord invites prospective tenant
+  proposalId <- landlord `submit` do
+    exerciseCmd masterId Invite 
+      with tenant
+
+  -- 4. Prospective tenant obtains rental terms to see if they suit him/her
+  rentalTerms <- tenant `submit` do
+    exerciseCmd proposalId RentalProposal_Inspect
+
+  -- 5. Prospective tenant thinks rental terms are suitable, so he/she accepts proposal
+  (rentalId, paymentId) <- tenant `submit` do
+    exerciseCmd proposalId RentalProposal_Accept
+
+  -- 6. Tenant makes first rent payment
+  let
+    today = date 2021 Jan 4
+  paymentId <- tenant `submit` do
+    exerciseCmd paymentId RentalPayments_PayRent 
+      with newPaymentDate = today   
+
+  -- 7. Tenant tries to make another rent payment in the same month
+  let
+    today = date 2021 Jan 20
+  tenant `submitMustFail` do
+    exerciseCmd paymentId RentalPayments_PayRent 
+      with newPaymentDate = today     
+      
+  -- 8. Tenant tries to make another rent payment on a date 
+  --    BEFORE the first rent payment but AFTER the lease came into effect
+  let
+    today = date 2021 Jan 3
+  tenant `submitMustFail` do
+    exerciseCmd paymentId RentalPayments_PayRent 
+      with newPaymentDate = today     
+      
+  -- 9. Tenant tries to go back in them and make payment 
+  --    on a date BEFORE the lease came into effect
+  let
+    today = date 2019 Feb 11
+  tenant `submitMustFail` do
+    exerciseCmd paymentId RentalPayments_PayRent 
+      with newPaymentDate = today    
+
+  -- 10. Tenant tries to make a payment on a date AFTER
+  --    the lease has expired
+  let
+    today = date 2022 Jun 15
+  tenant `submitMustFail` do
+    exerciseCmd paymentId RentalPayments_PayRent 
+      with newPaymentDate = today    
+
+  -- 11. Tenant pays rent late the next month
+  --     A penalty should be levied, but that's yet to be implemented.
+  let
+    today = date 2021 Feb 5
+  paymentId <- tenant `submit` do
+    exerciseCmd paymentId RentalPayments_PayRent 
+      with newPaymentDate = today      
+
+  pure()
