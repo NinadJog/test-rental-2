@@ -1,6 +1,7 @@
 module Main where
 
 import DA.Date
+import DA.Optional
 
 {- Revised version of the apartment rental program
 
@@ -10,13 +11,12 @@ import DA.Date
    * Composes choices
    * Does not use stable keys
 
-    Author: Ninad Jog
-    May 8, 2021
+    Author:   Ninad Jog
+    Created:  May 8, 2021
+    Updated:  May 24, 2021
 
     TBD:
-    * Calculate rent penalties accurately
-    * Calculate unpaid rent of previous months
-    * Update penalties in ledger
+    * Disallow payemnts after exipration of lease
     * Archive contracts gracefully when the lease ends
     * Rental payments logistics should be in a separate module
 -}
@@ -33,8 +33,8 @@ createRentalTerms = RentalTerms
     leasePeriod = 12  -- 12 months
     startDate   = date 2021 Jan 1
 
-    latePercent = 10  -- 10% penalty
-    penalty     = 2   -- 2 months rent
+    latePenalty   = 10  -- 10% penalty
+    breakPenalty  = 2   -- 2 months rent
 
 -- =======================================================================
 {- Master contract for a rental
@@ -131,14 +131,14 @@ template RentalAgreement
 -- =======================================================================
 -- Rent and payment terms, including penalties
 data RentalTerms = RentalTerms with
-  rent        : Int       -- Monthly rent
-  currency    : Currency  -- "USD", "Euro", etc.
+  rent          : Int       -- Monthly rent
+  currency      : Currency  -- "USD", "Euro", etc.
 
-  leasePeriod : Int     -- Lease period in months
-  startDate   : Date    -- Lease start date
+  leasePeriod   : Int     -- Lease period in months
+  startDate     : Date    -- Lease start date
 
-  latePercent : Int     -- Example: 5% penalty for paying after 5th of month
-  penalty     : Int     -- Penalty for breaking lease: 2 months rent payment
+  latePenalty   : Int     -- Example: 5% penalty for paying rent after 5th of month
+  breakPenalty  : Int     -- Penalty for breaking lease: 2 months rent payment
     deriving (Show, Eq)
 
 -- =======================================================================
@@ -163,34 +163,55 @@ hasLeaseExpired curDate rentalTerms =
     endDate = addDays rentalTerms.startDate 365
 
 -------------------------------
--- Calculate rent + penalty based on previous & current payment dates
--- (This function is pure even though one of the parameters passed to it, 
--- prevDate, comes from the ledger.)
+data PaymentDetails = PaymentDetails with
+  rent    : Int
+  penalty : Int
+  info    : Text
+    deriving (Show, Eq)
 
-calculateRent : Date -> Date -> RentalTerms -> Int
-calculateRent prevDate newDate rentalTerms 
+-------------------------------
+{- Calculates the payment due, including rent and penalty.
+   Returns a None if no payments are due.
+-}
+calcPaymentDue : Date -> Date -> RentalTerms -> Optional PaymentDetails
+calcPaymentDue newDate oldDate rt 
 
-  | daysPassed <= 0                     = 0   -- New date can't occur before previous date
-  | isSameMonth prevDate newDate        = 0   -- Can't make two rent payments in same month of same year
-  | hasLeaseExpired newDate rentalTerms = 0   -- Can't make rent payment after lease has expired
-  | otherwise                           = determineRent prevDate newDate rentalTerms
+  | daysPassed <= 0             = None -- Payment date can't be before date of previous payment
+  | isSameMonth newDate oldDate = None -- Cannot make two rent payments in the same month
+  | otherwise                   = Some paymentDue
   where
-    -- Days passed since the last payment
-    -- Subtract date of the last payment from the new payment date
-    daysPassed = subDate newDate prevDate
+    daysPassed = subDate newDate oldDate  -- Days since last payment
+    paymentDue = calcRentAndPenalty newDate oldDate rt
 
-----
--- TBD: Handle the Int to Decimal conversion and back for calculating the penalty
-determineRent : Date -> Date -> RentalTerms -> Int
-determineRent prevDate newDate rt =
-  newRent + penalty
+------------------------------
+-- Call this function only if you are sure that rent and/or penalty is due.
+calcRentAndPenalty : Date -> Date -> RentalTerms -> PaymentDetails
+calcRentAndPenalty newDate oldDate rt = 
+
+  PaymentDetails with
+    rent
+    penalty
+    info = "Rent and penalty"
+
   where
-    (_, prevM, _)  = toGregorian prevDate
-    (_, newM, day) = toGregorian newDate
-    newRent        = rt.rent -- (fromEnum newM - fromEnum prevM) * rt.rent
-    penalty     = ifThenElse (day <= 5) 
-                    0 -- No penalty if payment is on or before 5th of month
-                    rt.rent + rt.latePercent * rt.rent / 100
+    (_, _, d) = toGregorian newDate
+    months    = monthDiff newDate oldDate -- months elapsed since last rent payment
+    rent      = months * rt.rent
+    penaltyM  = ifThenElse (d <= 5) (months - 1) months -- months for which penalty must be charged
+    penalty   = penaltyM * rt.rent * rt.latePenalty / 100
+
+--------------------------------
+{- 
+Given two dates, this function returns the number of months between them
+Returns a negative number if newDate occurs before oldDate.
+For example, for any dates in Feb 2019 and Oct 2018, the month diff is 4
+-}
+monthDiff : Date -> Date -> Int
+monthDiff newDate oldDate =
+  12 * (y2 - y1) + (fromEnum m2 - fromEnum m1)
+  where
+    (y2, m2, _) = toGregorian newDate
+    (y1, m1, _) = toGregorian oldDate
 
 -- =======================================================================
 -- TEMPLATE FOR RENTAL PAYMENT LOGISTICS
@@ -231,17 +252,15 @@ template RentalPayments
          Tenant cannot pay rent twice for the same month, so this function
          returns 0 if the tenant tries to do that.
       -}
-      nonconsuming RentalPayments_GetRentDue : Int
+      nonconsuming RentalPayments_GetRentDue : Optional PaymentDetails
         with
           newPaymentDate : Date
         do
           -- Get the rental terms using the RentalAgreement foreign key
           rentalTerms <- exercise rentalId RentalAgreement_Inspect
           let 
-            rent    = rentalTerms.rent
-            newRent = calculateRent paymentDate newPaymentDate rentalTerms
-
-          return newRent
+            balanceDue = calcPaymentDue newPaymentDate paymentDate rentalTerms
+          return $ balanceDue
 
       ------------------------------
       {- Tenant should exercise this choice to pay rent
@@ -257,16 +276,21 @@ template RentalPayments
           -- newRent = exercise (ContractId this) GetRentDue
           rentalTerms <- exercise rentalId RentalAgreement_Inspect
           let
-            newRent = calculateRent paymentDate newPaymentDate rentalTerms
-
+            balanceDue = calcPaymentDue newPaymentDate paymentDate rentalTerms
+ 
           assertMsg
-            "Will not create a new ledger entry as no rent is due"
-            (newRent > 0)
+            "Will not create a new ledger entry as no rent or penalty is due"
+            (isSome balanceDue)
+        
+          let 
+            (newRent, newPenalty) = case balanceDue of
+              Some bal  -> (bal.rent, bal.penalty)
+              None      -> (0, 0)
 
           create this with
-            paymentDate = newPaymentDate
-            rent        = newRent
-            totalAmt    = totalAmt + newRent
-
+              paymentDate = newPaymentDate
+              rent        = newRent
+              penalty     = newPenalty
+              totalAmt    = totalAmt + newRent + newPenalty
 
 

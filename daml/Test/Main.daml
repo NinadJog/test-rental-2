@@ -49,13 +49,15 @@ rentTest = script do
     exerciseCmd paymentId RentalPayments_PayRent 
       with newPaymentDate = today     
       
-  -- 9. Tenant tries to go back in them and make payment 
+  -- 9. Tenant tries to go back in time and make payment 
   --    on a date BEFORE the lease came into effect
   let
     today = date 2019 Feb 11
   tenant `submitMustFail` do
     exerciseCmd paymentId RentalPayments_PayRent 
       with newPaymentDate = today    
+
+  {- TBD: Enable this later:
 
   -- 10. Tenant tries to make a payment on a date AFTER
   --    the lease has expired
@@ -64,11 +66,18 @@ rentTest = script do
   tenant `submitMustFail` do
     exerciseCmd paymentId RentalPayments_PayRent 
       with newPaymentDate = today    
-
-  -- 11. Tenant pays rent late the next month
-  --     A penalty should be levied, but that's yet to be implemented.
+  -}
+  
+  -- 11. Tenant gets balance due after a few months
   let
-    today = date 2021 Feb 5
+    today = date 2021 Apr 7
+  
+  {-
+  balanceDue <- tenant `submit` do
+    exerciseCmd paymentId RentalPayments_GetBalanceDue
+        with newPaymentDate = today
+  -}
+  -- 12. Tenant pays balance due
   paymentId <- tenant `submit` do
     exerciseCmd paymentId RentalPayments_PayRent 
       with newPaymentDate = today      
